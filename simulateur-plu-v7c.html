@@ -1,0 +1,212 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Simulateur PLU – Architecta</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <style>
+    body { margin:0; font-family:'Arial', sans-serif; background-color: #f9f9f9; color: #1e2b3b; }
+    header { display:flex; align-items:center; padding:15px 20px; background:#fff; border-bottom:1px solid #ddd; }
+    header img { height:60px; margin-right:20px; }
+    h1 { font-size: 1.8em; color: #1e2b3b; }
+    .container { padding:20px; }
+    .input-group { margin-bottom: 10px; }
+    input, button {
+      padding: 10px;
+      margin: 5px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 16px;
+    }
+    #validateBtn {
+      background-color: #CD7F32;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+    #validateBtn:hover {
+      background-color: #b56f2d;
+    }
+    #map, #cadastreMap { height: 300px; margin: 10px 0; border: 1px solid #ddd; }
+    strong { color: #1e2b3b; }
+    #info { padding: 15px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+<header>
+  <img src="logo-architecta.png" alt="Logo Architecta">
+  <h1 style="margin:0 auto;">Simulateur PLU – Architecta</h1>
+</header>
+<div class="container">
+  <div class="input-group">
+    <label>Adresse : </label>
+    <input type="text" id="addr" placeholder="Ex. : 5 rue du Lavoir">
+  </div>
+  <div class="input-group">
+    <label>Surface du terrain (m²) : </label>
+    <input type="number" id="terrain">
+  </div>
+  <div class="input-group">
+    <label>Surface déjà construite (m²) : </label>
+    <input type="number" id="existant" readonly>
+  </div>
+  <button id="validateBtn" onclick="findZone()">Afficher les règles du PLU</button>
+  <div id="info"></div>
+</div>
+
+<div class="container">
+  <h3>🗺 Carte principale (PLU)</h3>
+  <div id="map"></div>
+
+  <h3>🗺 Cadastre de la parcelle</h3>
+  <div id="cadastreMap"></div>
+</div>
+
+<script>
+  const map = L.map('map').setView([43.6625, 1.6056], 15);
+  const cadastreMap = L.map('cadastreMap').setView([43.6625, 1.6056], 17);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM' }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM' }).addTo(cadastreMap);
+
+  let marker, cadastreMarker, parcellesData, geojsonBuildings;
+
+  fetch('batiments-saint-marcel.geojson').then(res => res.json()).then(data => { geojsonBuildings = data; });
+  fetch('parcelles-saint-marcel.geojson').then(res => res.json()).then(data => { parcellesData = data; });
+
+  async function findZone() {
+    const addr = document.getElementById('addr').value.trim();
+    const terrain = parseFloat(document.getElementById('terrain').value);
+    if (!addr || isNaN(terrain)) {
+      document.getElementById('info').innerHTML = '<span style="color:red">Merci de remplir l'adresse et la surface du terrain.</span>';
+      return;
+    }
+
+    const fullAddr = addr + ' Saint-Marcel-Paulel';
+    const resp = await fetch('https://api-adresse.data.gouv.fr/search/?q=' + encodeURIComponent(fullAddr) + '&limit=1');
+    const json = await resp.json();
+    if (!json.features?.length) {
+      return document.getElementById('info').innerHTML = 'Adresse non trouvée';
+    }
+
+    const [lon, lat] = json.features[0].geometry.coordinates;
+    const point = turf.point([lon, lat]);
+
+    if (marker) map.removeLayer(marker);
+    if (cadastreMarker) cadastreMap.removeLayer(cadastreMarker);
+    marker = L.marker([lat, lon]).addTo(map);
+    cadastreMarker = L.marker([lat, lon]).addTo(cadastreMap);
+    map.setView([lat, lon], 17);
+    cadastreMap.setView([lat, lon], 18);
+
+    // Surface bâtie automatique
+    let surfaceTotale = 0;
+    geojsonBuildings.features.forEach(feature => {
+      const polygon = turf.polygon(feature.geometry.coordinates);
+      const center = turf.centerOfMass(polygon);
+      const distance = turf.distance(point, center, {units: 'meters'});
+      if (distance < 25) {
+        const area = turf.area(polygon);
+        surfaceTotale += area;
+      }
+    });
+
+    const existant = Math.round(surfaceTotale);
+    document.getElementById('existant').value = existant;
+
+    // Détection de parcelle
+    let refParcelle = 'Parcelle inconnue';
+    parcellesData.features.forEach(p => {
+      const poly = turf.polygon(p.geometry.coordinates);
+      if (turf.booleanPointInPolygon(point, poly)) {
+        refParcelle = `${p.properties.code_insee} ${p.properties.section} ${p.properties.numero}`;
+        L.geoJSON(p).addTo(cadastreMap);
+      }
+    });
+
+    
+    // Zone PLU
+    let zoneCode = 'Zone non trouvée';
+    try {
+      const wfsURL = `https://wxs.ign.fr/essentiels/geoportail/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=PLU.UTILISATION.SOLS&OUTPUTFORMAT=application/json&SRSNAME=EPSG:4326&BBOX=${lon-0.0001},${lat-0.0001},${lon+0.0001},${lat+0.0001}`;
+      const zoneResp = await fetch(wfsURL);
+      const geo = await zoneResp.json();
+
+      if (geo.features.length > 0 && geo.features[0].properties) {
+        zoneCode = geo.features[0].properties.libelle || geo.features[0].properties.zone || 'Zone inconnue';
+      }
+    } catch(e) {
+      zoneCode = 'PLU non disponible actuellement';
+    }
+    
+    const wfsURL = `https://wxs.ign.fr/essentiels/geoportail/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=PLU.UTILISATION.SOLS&OUTPUTFORMAT=application/json&SRSNAME=EPSG:4326&bbox=${lon-0.0001},${lat-0.0001},${lon+0.0001},${lat+0.0001}`;
+    const zoneResp = await fetch(wfsURL);
+    const geo = await zoneResp.json();
+
+    let zoneCode = 'Zone inconnue';
+    if (geo.features.length > 0 && geo.features[0].properties) {
+      zoneCode = geo.features[0].properties.libelle || geo.features[0].properties.zone || 'Zone non définie';
+    }
+
+    const rules = getRules(zoneCode);
+    let empriseMax = (rules.emprise / 100) * terrain;
+    let empriseRestante = empriseMax - existant;
+
+    document.getElementById('info').innerHTML = `
+      <strong>Zone :</strong> ${zoneCode}<br><br>
+      <strong>📋 Parcelle cadastrale :</strong> ${refParcelle}<br><br>
+      <strong>🏗 Emprise au sol (taux : ${rules.emprise}%) :</strong><br>
+      - Autorisée : ${empriseMax.toFixed(1)} m²<br>
+      - Construite (estimée) : ${existant} m²<br>
+      - Restante : <strong>${empriseRestante > 0 ? empriseRestante.toFixed(1) : 0} m²</strong><br><br>
+      <strong>📏 Hauteur maximale :</strong> ${rules.hauteur} m<br>
+      <strong>↔️ Prospect minimum :</strong> ${rules.prospect}
+    `;
+  }
+
+  function getRules(zone) {
+    const base = {
+      'UA': {emprise:60, hauteur:9, prospect:'H/2 ou 3 m'},
+      'UB': {emprise:50, hauteur:9, prospect:'3 m'},
+      'A': {emprise:5, hauteur:6, prospect:'5 m'},
+      'N': {emprise:1, hauteur:4, prospect:'10 m'}
+    };
+    const code = zone.toUpperCase().slice(0, 2);
+    return base[code] || {emprise:0, hauteur:0, prospect:'non défini'};
+  }
+</script>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const input = document.getElementById('addr');
+  const datalist = document.createElement('datalist');
+  datalist.id = 'adresse-suggestions';
+  document.body.appendChild(datalist);
+  input.setAttribute('list', 'adresse-suggestions');
+
+  let debounceTimer;
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    const value = input.value.trim();
+    if (value.length < 3) return;
+    debounceTimer = setTimeout(() => {
+      fetch(`https://api-adresse.data.gouv.fr/search/?q=${encodeURIComponent(value)}&limit=5`)
+        .then(res => res.json())
+        .then(data => {
+          datalist.innerHTML = '';
+          data.features.forEach(feature => {
+            const option = document.createElement('option');
+            option.value = feature.properties.label;
+            datalist.appendChild(option);
+          });
+        });
+    }, 300);
+  });
+});
+</script>
+
+</body>
+</html>
